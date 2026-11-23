@@ -16,6 +16,9 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL") or "PASTE_YOUR_DISCORD_WEBHOOK_URL_H
 TARGET_URL = "https://www.sc.su.ac.th/"
 BOT_NAME = "POSNBot"
 
+MENTION_TEXT = "@everyone"  # Use "@everyone", "<@&ROLE_ID>", or "" for no ping
+KEYWORDS = ["posn", "สอวน", "โอลิมปิกวิชาการ"]  # Set to [] to alert on ALL updates
+
 CHECK_INTERVAL = 30       # Check every 30 seconds
 MAX_RUNTIME = 13.5 * 60   # Loop for 13.5 minutes per GitHub Action run
 
@@ -31,6 +34,13 @@ HEADERS = {
 }
 
 
+def matches_keywords(text: str) -> bool:
+    if not KEYWORDS:
+        return True
+    lowered = text.lower()
+    return any(kw.lower() in lowered for kw in KEYWORDS)
+
+
 def fetch_page(url: str) -> str:
     try:
         res = requests.get(url, headers=HEADERS, timeout=15)
@@ -41,7 +51,7 @@ def fetch_page(url: str) -> str:
     return res.text
 
 
-def parse_page(html: str, base_url: str) -> tuple[dict[str, str], str]:
+def parse_page(html: str, base_url: str) -> tuple[dict[str, str], list[str], str]:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript", "meta"]):
         tag.decompose()
@@ -56,9 +66,14 @@ def parse_page(html: str, base_url: str) -> tuple[dict[str, str], str]:
         if len(title) >= 4:
             links[full_url] = title
 
-    clean_text = " ".join(soup.get_text().split())
+    lines = [
+        " ".join(line.split())
+        for line in soup.get_text("\n").splitlines()
+        if len(" ".join(line.split())) >= 4
+    ]
+    clean_text = "\n".join(lines)
     text_hash = hashlib.sha256(clean_text.encode("utf-8")).hexdigest()
-    return links, text_hash
+    return links, lines, text_hash
 
 
 def load_state() -> dict | None:
@@ -68,26 +83,59 @@ def load_state() -> dict | None:
     return None
 
 
-def save_state(links: dict[str, str], text_hash: str) -> None:
+def save_state(links: dict[str, str], lines: list[str], text_hash: str) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"links": links, "text_hash": text_hash}, f, ensure_ascii=False, indent=2)
+        json.dump(
+            {"links": links, "lines": lines, "text_hash": text_hash},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
 
-def send_discord_notification(new_links: list[tuple[str, str]], page_changed_only: bool = False) -> None:
+def send_test_notification() -> None:
+    payload = {
+        "username": BOT_NAME,
+        "content": f"{MENTION_TEXT} *(Test message)*".strip(),
+        "allowed_mentions": {"parse": ["everyone", "roles", "users"]},
+        "embeds": [
+            {
+                "title": "✅ POSNBot Test Notification",
+                "url": TARGET_URL,
+                "description": (
+                    "POSNBot is connected and working! You will receive an alert like this "
+                    "whenever a new **POSN / สอวน.** update appears on **sc.su.ac.th**."
+                ),
+                "color": 0x00A86B,
+                "footer": {"text": f"Tested at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"},
+            }
+        ],
+    }
+    res = requests.post(WEBHOOK_URL, json=payload, timeout=15)
+    res.raise_for_status()
+    print(f"[{datetime.now():%H:%M:%S}] Test notification sent to Discord!")
+
+
+def send_discord_notification(
+    new_links: list[tuple[str, str]], matched_lines: list[str] | None = None
+) -> None:
     if new_links:
         lines = [f"• **[{title}]({url})**" for url, title in new_links[:10]]
         if len(new_links) > 10:
             lines.append(f"*...and {len(new_links) - 10} more new links.*")
         description = "\n".join(lines)
-        title = f"📢 New Update on sc.su.ac.th ({len(new_links)} new item{'s' if len(new_links) > 1 else ''})"
-    elif page_changed_only:
-        description = f"Content on **{TARGET_URL}** was modified, though no new links were added."
-        title = "🔄 Page Content Updated on sc.su.ac.th"
+        title = f"📢 POSN Update on sc.su.ac.th ({len(new_links)} new item{'s' if len(new_links) > 1 else ''})"
+    elif matched_lines:
+        snippets = [f"• {line[:180]}" for line in matched_lines[:5]]
+        description = "New POSN-related text appeared on the page:\n" + "\n".join(snippets)
+        title = "🔄 POSN Text Updated on sc.su.ac.th"
     else:
         return
 
     payload = {
         "username": BOT_NAME,
+        "content": MENTION_TEXT,
+        "allowed_mentions": {"parse": ["everyone", "roles", "users"]},
         "embeds": [
             {
                 "title": title,
@@ -107,34 +155,49 @@ def run_loop() -> None:
     if "PASTE_YOUR_DISCORD_WEBHOOK_URL_HERE" in WEBHOOK_URL:
         raise ValueError("Set your WEBHOOK_URL first.")
 
+    if os.environ.get("SEND_TEST", "").lower() == "true":
+        send_test_notification()
+
     state = load_state()
     start_time = time.time()
 
     while True:
         try:
             html = fetch_page(TARGET_URL)
-            current_links, current_hash = parse_page(html, TARGET_URL)
+            current_links, current_lines, current_hash = parse_page(html, TARGET_URL)
 
             if state is None:
-                save_state(current_links, current_hash)
-                state = {"links": current_links, "text_hash": current_hash}
+                save_state(current_links, current_lines, current_hash)
+                state = {"links": current_links, "lines": current_lines, "text_hash": current_hash}
                 print(f"[{datetime.now():%H:%M:%S}] Baseline saved ({len(current_links)} links indexed).")
             else:
                 old_links = state.get("links", {})
-                new_items = [(url, title) for url, title in current_links.items() if url not in old_links]
+                old_lines = set(state.get("lines", []))
+
+                new_items = [
+                    (url, title)
+                    for url, title in current_links.items()
+                    if url not in old_links and matches_keywords(f"{title} {url}")
+                ]
+
+                new_matching_lines = (
+                    [line for line in current_lines if line not in old_lines and matches_keywords(line)]
+                    if old_lines
+                    else []
+                )
 
                 if new_items:
-                    print(f"[{datetime.now():%H:%M:%S}] Found {len(new_items)} new link(s)! Sending alert...")
+                    print(f"[{datetime.now():%H:%M:%S}] Found {len(new_items)} POSN link(s)! Sending alert...")
                     send_discord_notification(new_items)
-                    save_state(current_links, current_hash)
-                    state = {"links": current_links, "text_hash": current_hash}
-                elif current_hash != state.get("text_hash"):
-                    print(f"[{datetime.now():%H:%M:%S}] Page text changed! Sending alert...")
-                    send_discord_notification([], page_changed_only=True)
-                    save_state(current_links, current_hash)
-                    state = {"links": current_links, "text_hash": current_hash}
+                elif new_matching_lines:
+                    print(f"[{datetime.now():%H:%M:%S}] POSN text changed! Sending alert...")
+                    send_discord_notification([], matched_lines=new_matching_lines)
                 else:
-                    print(f"[{datetime.now():%H:%M:%S}] No changes.")
+                    print(f"[{datetime.now():%H:%M:%S}] No POSN updates.")
+
+                if current_links != old_links or current_hash != state.get("text_hash") or not old_lines:
+                    save_state(current_links, current_lines, current_hash)
+                    state = {"links": current_links, "lines": current_lines, "text_hash": current_hash}
 
         except Exception as e:
             print(f"[{datetime.now():%H:%M:%S}] Check failed (will retry in {CHECK_INTERVAL}s): {e}")
