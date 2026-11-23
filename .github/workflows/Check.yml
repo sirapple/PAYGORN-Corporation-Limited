@@ -22,7 +22,7 @@ jobs:
       - run: pip install requests beautifulsoup4
       - name: Run POSNBot
         env:
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_URL: ${{ secrets.PAYGORN }}
         run: python posn_bot.py
       - name: Save updated state
         run: |
